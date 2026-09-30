@@ -23,14 +23,81 @@ RWTexture2D<float>  gOutputReservoirConfidences;
 uniform uint2 gFrameDim;
 uniform uint  gFrameSeed;
 
+// Previous-frame resources (temporal reuse)
+Texture2D<float2> gMotionVectors;              // Screen-space motion vectors
+Texture2D<float>  gLinearZ;                    // Current-frame linear depth
+Texture2D<float>  gPrevLinearZ;                // Previous-frame linear depth
+Texture2D<float4> gPrevNormalRoughness;        // Previous-frame world-space normals + roughness
+StructuredBuffer<Reservoir> gPrevReservoirs;   // Previous-frame reservoirs (read-only)
+Texture2D<float>  gPrevReservoirConfidences;   // Previous-frame reservoir confidences (read-only)
+
 struct Reservoir
 {
     float3 radiance = 0;
-    float  UCW = 0;
-    uint3  sample = {}; // RNG seed
-    float  confidence = 1; // confidence is also stored in gOutputReservoirConfidences, but duplicated here for convenience
+    float UCW = 0;
+    uint3 sample = {}; // RNG seed
+    float confidence = 1; // confidence is also stored in gOutputReservoirConfidences, but duplicated here for convenience
+    float3 _;
+    float weightSum = 0;
 
     float phat() { return luminance(radiance); }
+}
+
+void combineReservoirWith<S : ISampleGenerator>(inout Reservoir current, Reservoir otherReservoir, float MISWeight, float3 radiance, float phat, float jacobian, inout S sg)
+{
+    if (otherReservoir.UCW <= 0.0f)
+    {
+        current.confidence += otherReservoir.confidence;
+        return;
+    }
+
+    float sampleWeight = MISWeight * phat * otherReservoir.UCW * jacobian;
+
+    current.confidence += otherReservoir.confidence;
+    current.weightSum += sampleWeight;
+
+    if (sampleNext1D(sg) * current.weightSum < sampleWeight)
+    {
+        current.sample = otherReservoir.sample;
+        current.radiance = radiance;
+    }
+}
+
+void getNormalization(inout float normalizationNumerator, inout float normalizationDenominator, Reservoir finalReservoir, float initialPhat, float temporalPhat)
+{
+    if (finalReservoir.weightSum <= 0.0f)
+    {
+        normalizationNumerator = 1.0f;
+        normalizationDenominator = 1.0f;
+        return;
+    }
+
+    normalizationNumerator = 1.0f;
+
+    // Checking how many of our neighbors could have produced the sample that we just picked
+    // and we're going to divide by the sum of M values of those neighbors.
+    normalizationDenominator = 0.0f;
+
+    normalizationDenominator += (initialPhat > 0.0f) * 1.0f;
+    normalizationDenominator += (temporalPhat > 0.0f) * 1.0f;
+}
+
+void endWithNormalization(inout Reservoir current, float normalizationNumerator, float normalizationDenominator)
+{
+    if (current.weightSum == 0.0f || current.weightSum < 1.0e-10f || current.weightSum > 1.0e10f || normalizationDenominator == 0.0f || normalizationNumerator == 0.0f)
+    {
+        current.UCW = 0.0f;
+    }
+    else
+    {
+        current.UCW = current.weightSum / current.phat() / normalizationDenominator;
+    }
+
+    // Hard limit confidence if there is no M cap.
+    if (current.confidence > 1000000.0f)
+    {
+        current.confidence = 1000000.0f;
+    }
 }
 
 ShadingData loadShadingData(const HitInfo hit, const float3 rayDir)
@@ -140,6 +207,7 @@ uint flattenIndex(uint2 index, uint width)
 {
     return index.y * width + index.x;
 }
+
 uint2 unflattenIndex(uint index, uint width)
 {
     return uint2(index%width, index/width);

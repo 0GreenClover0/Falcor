@@ -13,8 +13,10 @@ namespace
 {
     inline const ChannelList kInputChannels = {
         // clang-format off
-        { "vbuffer",        "gVBuffer",     "Visibility buffer in packed format" },
-        { "viewW",          "gViewW",       "World-space view direction (xyz float format)", true /* optional */ },
+        { "vbuffer",        "gVBuffer",         "Visibility buffer in packed format" },
+        { "viewW",          "gViewW",           "World-space view direction (xyz float format)", true /* optional */ },
+        { "motionVectors",  "gMotionVectors",   "Screen-space motion vectors",                   true /* optional */ },
+        { "linearZ",          "gLinearZ",           "Linear depth buffer",                       true /* optional */ },
         // clang-format on
     };
     inline const ChannelList kOutputChannels = {
@@ -58,10 +60,16 @@ void MiniSPMIS::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene
     mpEnvSampler = nullptr;
 
     mpInitialSamplingPass = nullptr;
+    mpTemporalReusePass = nullptr;
     mpCreateReservoirCellPass = nullptr;
     mpComputeOffsetsPass = nullptr;
     mpSortPass = nullptr;
     mpSpatialReusePass = nullptr;
+
+    // Invalidate previous-frame resources so they are reallocated for the new scene.
+    mpPrevReservoirs = nullptr;
+    mpPrevNormalRoughness = nullptr;
+    mpPrevDepth = nullptr;
 }
 
 bool MiniSPMIS::onMouseEvent(const MouseEvent& mouseEvent)
@@ -72,6 +80,7 @@ bool MiniSPMIS::onMouseEvent(const MouseEvent& mouseEvent)
 void MiniSPMIS::renderUI(Gui::Widgets& widget)
 {
     widget.checkbox("Enable SPMIS", mEnableSpmis);
+    widget.checkbox("Enable temporal reuse", mEnableTemporal);
     if (auto group = widget.group("SPMIS"))
     {
         ImGui::BeginDisabled(!mEnableSpmis);
@@ -134,7 +143,20 @@ void MiniSPMIS::execute(RenderContext* pRenderContext, const RenderData& renderD
     mpPixelDebug->beginFrame(pRenderContext, renderData.getDefaultTextureDims());
 
     sampleInitialPaths(pRenderContext, renderData);
+    temporalReuse(pRenderContext, renderData);
     spmis(pRenderContext, renderData);
+
+    // Copy current reservoirs / G-buffer data into prev-frame buffers.
+    // This must happen after all reuse passes so we archive the fully-resampled state.
+    if (mpPrevReservoirs && mpReservoirs)
+        pRenderContext->copyResource(mpPrevReservoirs.get(), mpReservoirs.get());
+
+    // Archive normal+roughness and depth for next-frame geometry validation.
+    if (mpPrevNormalRoughness)
+        pRenderContext->copyResource(mpPrevNormalRoughness.get(), renderData.getTexture("normalRoughness").get());
+
+    if (mpPrevDepth && renderData.getTexture("linearZ"))
+        pRenderContext->copyResource(mpPrevDepth.get(), renderData.getTexture("linearZ").get());
 
     mpPixelDebug->endFrame(pRenderContext);
 
@@ -167,6 +189,10 @@ void MiniSPMIS::sampleInitialPaths(RenderContext* pRenderContext, const RenderDa
     {
         mpReservoirs = mpDevice->createStructuredBuffer(reflectVar["gOutputReservoirs"], numPixels);
         mpReservoirConfidences = mpDevice->createTexture2D(outputDim.x, outputDim.y, ResourceFormat::R32Float, 1u, 1u, nullptr, ResourceBindFlags::ShaderResource|ResourceBindFlags::UnorderedAccess);
+
+        mpPrevDepth = mpDevice->createTexture2D(outputDim.x, outputDim.y, ResourceFormat::RG32Float, 1u, 1u, nullptr,
+                                                ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess);
+        pRenderContext->clearUAV(mpPrevDepth->getUAV().get(), float4(0.f));
     }
 
     // Bind resources
@@ -199,6 +225,78 @@ void MiniSPMIS::sampleInitialPaths(RenderContext* pRenderContext, const RenderDa
 
     FALCOR_PROFILE(pRenderContext, "Initial sampling");
     mpInitialSamplingPass->execute(pRenderContext, outputDim);
+}
+
+void MiniSPMIS::temporalReuse(RenderContext* pRenderContext, const RenderData& renderData)
+{
+    if (!mEnableTemporal)
+        return;
+
+    // Skip on frame 0 — no previous-frame data exists yet.
+    if (mFrameSeed == 0)
+        return;
+
+    // Skip if motion vectors or depth are not connected (optional channels).
+    if (!renderData.getTexture("motionVectors") || !renderData.getTexture("linearZ"))
+        return;
+
+    FALCOR_PROFILE(pRenderContext, "Temporal reuse");
+
+    const uint3 outputDim = uint3(renderData.getDefaultTextureDims(), 1u);
+    FALCOR_ASSERT(outputDim.x > 0 && outputDim.y > 0);
+
+    DefineList defines;
+    mpScene->getShaderDefines(defines);
+    defines.add(getValidResourceDefines(kInputChannels, renderData));
+    defines.add(getValidResourceDefines(kOutputChannels, renderData));
+    defines.add("SCENE_HAS_EMISSIVE_LIGHTS", mpScene->useEmissiveLights() ? "1" : "0");
+    defines.add("SCENE_HAS_ENV_LIGHT",       mpScene->useEnvLight() ? "1" : "0");
+    defines.add("SCENE_HAS_ENV_BACKGROUND",  mpScene->useEnvBackground() ? "1" : "0");
+
+    preparePass(mpTemporalReusePass, "RenderPasses/MiniSPMIS/TemporalReuse.cs.slang", "main", defines);
+
+    const uint numPixels = outputDim.x * outputDim.y;
+
+    // Allocate previous-frame resources on first use (or if resolution changed).
+    auto reflectVar = mpTemporalReusePass->getRootVar();
+    if (!mpPrevReservoirs || mpPrevReservoirs->getElementCount() != numPixels)
+    {
+        mpPrevReservoirs = mpDevice->createStructuredBuffer(
+            reflectVar["gPrevReservoirs"], numPixels,
+            ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess);
+
+        mpPrevNormalRoughness = mpDevice->createTexture2D(
+            outputDim.x, outputDim.y, ResourceFormat::RGBA32Float, 1u, 1u, nullptr,
+            ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess);
+    }
+
+    // Bind all resources.
+    auto var = mpTemporalReusePass->getRootVar();
+
+    var["gOutputColor"]              = renderData.getTexture("color");
+    var["gOutputNormalRoughness"]    = renderData.getTexture("normalRoughness");
+    var["gOutputReservoirs"]         = mpReservoirs;
+    var["gOutputReservoirConfidences"] = mpReservoirConfidences;
+    var["gMotionVectors"]            = renderData.getTexture("motionVectors");
+    var["gLinearZ"]                  = renderData.getTexture("linearZ");
+    var["gPrevLinearZ"]              = mpPrevDepth;
+    var["gPrevNormalRoughness"]      = mpPrevNormalRoughness;
+    var["gPrevReservoirs"]           = mpPrevReservoirs;
+    if (mpEnvSampler) mpEnvSampler->bindShaderData(var["gEnvSampler"]);
+    var["gFrameDim"]   = uint2(outputDim.x, outputDim.y);
+    var["gFrameSeed"]  = mUseFixedSeed ? mFixedSeed : mFrameSeed;
+
+    mpPixelDebug->prepareProgram(mpTemporalReusePass->getProgram(), var);
+    mpScene->bindShaderDataForRaytracing(pRenderContext, var["gScene"]);
+
+    for (auto channel : kInputChannels)
+        if (!channel.texname.empty())
+            var[channel.texname] = renderData.getTexture(channel.name);
+    for (auto channel : kOutputChannels)
+        if (!channel.texname.empty())
+            var[channel.texname] = renderData.getTexture(channel.name);
+
+    mpTemporalReusePass->execute(pRenderContext, outputDim);
 }
 
 void MiniSPMIS::spmis(RenderContext* pRenderContext, const RenderData& renderData)

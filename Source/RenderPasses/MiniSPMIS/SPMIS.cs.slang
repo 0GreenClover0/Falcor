@@ -148,7 +148,7 @@ uint  quantizeConfidence(float c) { return uint(c * 1000); }
 float dequantizeConfidence(uint q) { return float(q) / 1000.f; }
 
 // Randomly select a high-confidence cell around the pixel.
-uint findSimilarCell<S : ISampleGenerator>(const uint2 pixel, inout S sg)
+uint3 findSimilarCell<S : ISampleGenerator>(const uint2 pixel, inout S sg)
 {
     const int4 centerAttribs = quantizeAttributes(pixel);
     const uint centerCell = gReservoirCells.find(hashPixel(pixel, centerAttribs));
@@ -157,10 +157,10 @@ uint findSimilarCell<S : ISampleGenerator>(const uint2 pixel, inout S sg)
 
     // uniform cell selection
 
-    const int2 p = clamp(int2(float2(pixel) + ((sampleNext2D(sg) - 0.5) * gJitterRadius)), 0, gFrameDim - 1);
-    const uint cell = gReservoirCells.find(hashPixel(p, quantizeAttributes(p)));
-    return (cell == HashSet::kInvalidIndex) ? centerCell : cell;
-
+    // const int2 p = clamp(int2(float2(pixel) + ((sampleNext2D(sg) - 0.5) * gJitterRadius)), 0, gFrameDim - 1);
+    // const uint cell = gReservoirCells.find(hashPixel(p, quantizeAttributes(p)));
+    // return (cell == HashSet::kInvalidIndex) ? centerCell : cell;
+    return uint3(0, 0, 0);
     #else
 
     // weighted cell selection
@@ -170,32 +170,63 @@ uint findSimilarCell<S : ISampleGenerator>(const uint2 pixel, inout S sg)
 
     const float c_center = (centerCell == HashSet::kInvalidIndex) ? 0 : dequantizeConfidence(gReservoirCellConfidences[centerCell]); ;
 
-    uint selected = centerCell;
-    float w_sum = c_center;
+    uint selected1 = centerCell;
+    uint selected2 = centerCell;
+    uint selected3 = centerCell;
+
+    float w_sum1 = c_center;
+    float w_sum2 = c_center;
+    float w_sum3 = c_center;
+
+    const int4 centerAttribsMinusOne = centerAttribs - 1;
+    const int4 centerAttribsPlusOne = centerAttribs + 1;
+
+    const uint2 frameDimMinusOne = gFrameDim - 1;
 
     for (uint i = 0; i < 8; i++)
     {
-        const int2 pixel_i = clamp(int2(pixel + sample_disk(sampleNext2D(sg)) * radius), 0, gFrameDim - 1);
+        const int2 pixel_i1 = clamp(int2(pixel + sample_disk(sampleNext2D(sg)) * radius), 0, frameDimMinusOne);
+        const int2 pixel_i2 = clamp(int2(pixel + sample_disk(sampleNext2D(sg)) * radius), 0, frameDimMinusOne);
+        const int2 pixel_i3 = clamp(int2(pixel + sample_disk(sampleNext2D(sg)) * radius), 0, frameDimMinusOne);
+
         // increase radius for next iteration
         radius *= 1.25;
 
         // clamp cell attributes to within 1 quantization step of the center pixel
-        const int4 attribs_i = clamp(quantizeAttributes(pixel_i), centerAttribs - 1, centerAttribs + 1);
+        const int4 attribs_i1 = clamp(quantizeAttributes(pixel_i1), centerAttribsMinusOne, centerAttribsPlusOne);
+        const int4 attribs_i2 = clamp(quantizeAttributes(pixel_i2), centerAttribsMinusOne, centerAttribsPlusOne);
+        const int4 attribs_i3 = clamp(quantizeAttributes(pixel_i3), centerAttribsMinusOne, centerAttribsPlusOne);
 
-        const uint cell = gReservoirCells.find(hashPixel(pixel_i, attribs_i));
-        if (cell == HashSet::kInvalidIndex)
-            continue; // no cell at pixel_i with similar quantized attributes
+        const uint cell1 = gReservoirCells.find(hashPixel(pixel_i1, attribs_i1));
+        const uint cell2 = gReservoirCells.find(hashPixel(pixel_i2, attribs_i2));
+        const uint cell3 = gReservoirCells.find(hashPixel(pixel_i3, attribs_i3));
 
-        if (cell == centerCell)
-            continue;
+        if (cell1 != HashSet::kInvalidIndex && cell1 != centerCell)
+        {
+            const float c_cell = dequantizeConfidence(gReservoirCellConfidences[cell1]);
+            w_sum1 += c_cell;
+            if (sampleNext1D(sg) * w_sum1 < c_cell)
+                selected1 = cell1;
+        }
 
-        const float c_cell = dequantizeConfidence(gReservoirCellConfidences[cell]);
-        w_sum += c_cell;
-        if (sampleNext1D(sg) * w_sum < c_cell)
-            selected = cell;
+        if (cell2 != HashSet::kInvalidIndex && cell2 != centerCell)
+        {
+            const float c_cell = dequantizeConfidence(gReservoirCellConfidences[cell2]);
+            w_sum2 += c_cell;
+            if (sampleNext1D(sg) * w_sum2 < c_cell)
+                selected2 = cell2;
+        }
+
+        if (cell3 != HashSet::kInvalidIndex && cell3 != centerCell)
+        {
+            const float c_cell = dequantizeConfidence(gReservoirCellConfidences[cell3]);
+            w_sum3 += c_cell;
+            if (sampleNext1D(sg) * w_sum3 < c_cell)
+                selected3 = cell3;
+        }
     }
 
-    return selected;
+    return uint3(selected1, selected2, selected3);
     #endif
 }
 
@@ -279,22 +310,31 @@ void main(uint2 pixel : SV_DispatchThreadID)
 
     UniformSampleGenerator sg = UniformSampleGenerator(pixel, pcg(gSpatialPassIndex + pcg(gFrameSeed)));
 
-    const uint cellId = findSimilarCell(pixel, sg);
-    if (cellId == HashSet::kInvalidIndex)
-        return; // shouldnt happen - the current pixel should always be in a cell
+    const int4 centerAttribs = quantizeAttributes(pixel);
+    const uint centerCell = gReservoirCells.find(hashPixel(pixel, centerAttribs));
 
+    gOutputColor[pixel] = float4(float(centerCell & 1), float(centerCell & 3) / 4, float(centerCell & 7) / 8, 1);
+    return;
+
+    // 2. cell <- SampleNeighborCell(c)
+    const uint cellId1 = findSimilarCell(pixel, sg).x;
+
+    // 4. Y <- 0 is not here. No output sample since this is not a function. Just merge with the center reservoir. 
     Reservoir center = gOutputReservoirs[flattenIndex(pixel, gFrameDim.x)];
     const float centerConfidence = dequantizeConfidence(quantizeConfidence(gOutputReservoirConfidences[pixel]));
 
-    const uint2 pixelRange = gReservoirCellInverseMap.getRange(cellId);
+    const uint2 pixelRange = gReservoirCellInverseMap.getRange(cellId1);
     const uint  pixelN = pixelRange.y - pixelRange.x;
     if (pixelN == 0)
         return; // shouldn't happen - the current pixel should always be in a cell
 
-    const float c_sum = dequantizeConfidence(gReservoirCellConfidences[cellId]) * (float(gSpatialCandidates) / float(pixelN));
+    // 3. cΣ <- cellConfidenceSums[cell]
+    const float c_sum = dequantizeConfidence(gReservoirCellConfidences[cellId1]) * (float(gSpatialCandidates) / float(pixelN));
 
+    // 5. w_sum <- 0
     float w_sum = 0;
 
+    // 6. if ˆp(X_c) > 0 then
     // estimate canonical MIS weight with a single sample
     if (center.phat() > 0)
     {
@@ -316,7 +356,7 @@ void main(uint2 pixel : SV_DispatchThreadID)
         w_sum = m_c * center.phat() * center.UCW;
     }
 
-    const uint2 reservoirRange = gReservoirCellMap.getRange(cellId);
+    const uint2 reservoirRange = gReservoirCellMap.getRange(cellId1);
     const uint reservoirN = reservoirRange.y - reservoirRange.x;
     if (reservoirN > 0)
     {

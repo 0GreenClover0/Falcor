@@ -111,6 +111,7 @@ private:
     void parseProperties(const Properties& props);
     void preparePass(ref<ComputePass>& pass, const char* shaderFile, const char* entryPoint, const DefineList& defines);
     void sampleInitialPaths(RenderContext* pRenderContext, const RenderData& renderData);
+    void temporalReuse(RenderContext* pRenderContext, const RenderData& renderData);
     void spmis(RenderContext* pRenderContext, const RenderData& renderData);
 
 private:
@@ -124,6 +125,14 @@ private:
 
     ref<Buffer>  mpReservoirs;
     ref<Texture> mpReservoirConfidences;
+
+    // ------------ Temporal reuse resources ------------
+
+    ref<ComputePass> mpTemporalReusePass;
+
+    ref<Buffer>  mpPrevReservoirs;           // previous-frame reservoir buffer (read-only in temporal pass)
+    ref<Texture> mpPrevNormalRoughness;      // previous-frame normal+roughness (for geometry validation)
+    ref<Texture> mpPrevDepth;               // previous-frame linear depth (for geometry validation)
 
     uint mFrameSeed = 0;
     uint mFixedSeed = 0;
@@ -143,6 +152,7 @@ private:
     ref<Buffer>  mpReservoirCellImportances; // cached reservoir importance (eq. 17)
 
     bool  mEnableSpmis = false;
+    bool  mEnableTemporal = true;
     uint  mPassCount = 1;
     uint  mCandidateCount = 3;
     bool  mDefensivePairwise = true;
